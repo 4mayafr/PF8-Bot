@@ -1,0 +1,17 @@
+{
+  "name": "pf8-bot",
+  "version": "1.0.0",
+  "description": "A Discord bot with a PF8-style personality that chats in one dedicated channel",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
