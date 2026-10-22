@@ -5,7 +5,7 @@ const {
   DISCORD_TOKEN,
   CHANNEL_ID,
   GEMINI_API_KEY,
-  GEMINI_MODEL = 'gemini-2.5-flash',
+  GEMINI_MODEL = 'gemini-3.8-flash',
   MENTION_ONLY = 'false',
   COOLDOWN_MS = '3000',
 } = process.env;
