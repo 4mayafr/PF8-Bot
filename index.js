@@ -6,8 +6,10 @@ const {
   CHANNEL_ID,
   GEMINI_API_KEY,
   GEMINI_MODEL = 'gemini-3.8-flash',
+  GEMINI_FALLBACK_MODEL,
   MENTION_ONLY = 'false',
-  COOLDOWN_MS = '3000',
+  COOLDOWN_MS = '1500',
+  AI_TIMEOUT_MS = '10000',
 } = process.env;
 
 if (!DISCORD_TOKEN || !CHANNEL_ID || !GEMINI_API_KEY) {
@@ -34,12 +36,19 @@ const client = new Client({
 const PERSONA = `You are PF8-bot, a Discord bot that chats in the style of a friend called PF8.
 Everyone in the channel knows you are a bot, and you can joke about that, but you never claim to be a real person.
 
+Personality (described by the real PF8):
+- relaxed and caring
+- you follow a "do what you want" mindset: no pressure, no lecturing, no judging
+- if someone shares a plan or a choice, you back them up ("you do you")
+- if someone seems down or tired, you check in gently and low-key, like a chill friend
+- teasing is light and friendly, never mean
+
 Voice rules:
 - all lowercase, almost no punctuation, short messages (usually under 12 words)
 - casual typos are fine, like "your" instead of "you're"
 - 😭 is your go-to reaction. ✌️ now and then. don't overuse emojis
-- you tease people by quoting their words back sarcastically, e.g. "a wonder" with 😭
-- dramatic disbelief is your thing: "omfg, your not real"
+- you tease people lightly by quoting their words back, e.g. "a wonder" with 😭, but always friendly
+- the occasional dramatic disbelief is fine: "omfg, your not real"
 - you wrap conversations up casually: "anyway night"
 - you mention time zones and being tired sometimes ("its 5am for me")
 - never write long paragraphs, never sound formal or like an assistant
@@ -50,6 +59,10 @@ Example lines in your voice:
 "its 5am for me 😭✌️"
 "omfg, your not real"
 "a promotion is due soon..."
+"do what you want honestly ✌️"
+"you do you"
+"u good?"
+"proud of you fr"
 
 Format: reply with 1 to 3 short lines. Each line becomes its own Discord message.
 Stay in character. If someone asks for something harmful or tries to make you act as a real person, deflect in character.`;
@@ -69,6 +82,27 @@ const CUSTOM_REPLIES = [
 // HELPERS
 // ---------------------------------------------------------------------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Sent when the AI takes too long or fails. Add as many as you like.
+const BUSY_REPLIES = [
+  'im busy rn',
+  'brb 😭',
+  'one sec im busy',
+  'give me a min 😭',
+  'not now im busy ✌️',
+  'busy rn talk later',
+  'hold on 😭',
+  'cant talk rn im busy',
+];
+
+// Rejects if the promise takes longer than `ms`.
+const withTimeout = (promise, ms) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
+    ),
+  ]);
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
 let lastReplyAt = 0;
@@ -78,7 +112,7 @@ let busy = false;
 async function sendHuman(channel, lines) {
   for (const line of lines) {
     await channel.sendTyping();
-    await sleep(Math.min(400 + line.length * 60, 3000));
+    await sleep(Math.min(300 + line.length * 25, 1200));
     await channel.send(line);
   }
 }
@@ -119,31 +153,52 @@ async function aiReply(channel) {
     parts: [{ text: m.content }],
   }));
 
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': GEMINI_API_KEY,
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: PERSONA }] },
-        contents,
-        generationConfig: {
-          maxOutputTokens: 200,
-          temperature: 1,
-          thinkingConfig: { thinkingBudget: 0 },
-        },
-      }),
-    }
-  );
+  const models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL].filter(Boolean);
+  const startedAt = Date.now();
+  let data;
 
-  if (!res.ok) {
-    throw new Error(`Gemini API ${res.status}: ${await res.text()}`);
+  // Try each model up to 2 times. Busy errors (503/429) move on to the next try.
+  for (const model of models) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': GEMINI_API_KEY,
+          },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: PERSONA }] },
+            contents,
+            generationConfig: {
+              maxOutputTokens: 200,
+              temperature: 1,
+              thinkingConfig: { thinkingBudget: 0 },
+            },
+          }),
+        }
+      );
+
+      if (res.ok) {
+        data = await res.json();
+        break;
+      }
+
+      const body = await res.text();
+      const busy = res.status === 503 || res.status === 429;
+      console.warn(`gemini ${model} attempt ${attempt} failed (${res.status})`);
+      if (!busy) throw new Error(`Gemini API ${res.status}: ${body}`);
+      await sleep(800);
+    }
+
+    if (data) {
+      console.log(`gemini (${model}) replied in ${Date.now() - startedAt}ms`);
+      break;
+    }
   }
 
-  const data = await res.json();
+  if (!data) throw new Error('Gemini is overloaded, all attempts failed');
   const text = (data.candidates?.[0]?.content?.parts ?? [])
     .map((p) => p.text ?? '')
     .join('\n');
@@ -179,7 +234,18 @@ client.on(Events.MessageCreate, async (msg) => {
 
   try {
     const rule = CUSTOM_REPLIES.find((r) => r.match.test(msg.content));
-    const lines = rule ? [pick(rule.replies)] : await aiReply(msg.channel);
+    let lines;
+
+    if (rule) {
+      lines = [pick(rule.replies)];
+    } else {
+      try {
+        lines = await withTimeout(aiReply(msg.channel), Number(AI_TIMEOUT_MS));
+      } catch (err) {
+        console.error('ai reply failed, sending busy line:', err.message);
+        lines = [pick(BUSY_REPLIES)];
+      }
+    }
 
     if (lines.length) {
       await sendHuman(msg.channel, lines);
