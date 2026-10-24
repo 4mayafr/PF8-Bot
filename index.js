@@ -4,16 +4,17 @@ import { Client, GatewayIntentBits, Events } from 'discord.js';
 const {
   DISCORD_TOKEN,
   CHANNEL_ID,
-  OPENAI_API_KEY,
-  OPENAI_MODEL = 'gpt-4o-mini',
-  OPENAI_FALLBACK_MODEL,
+  AI_API_KEY,
+  AI_BASE_URL = 'https://api.groq.com/openai/v1',
+  AI_MODEL = 'llama-3.3-70b-versatile',
+  AI_FALLBACK_MODEL,
   MENTION_ONLY = 'false',
   COOLDOWN_MS = '1500',
   AI_TIMEOUT_MS = '10000',
 } = process.env;
 
-if (!DISCORD_TOKEN || !CHANNEL_ID || !OPENAI_API_KEY) {
-  console.error('Missing DISCORD_TOKEN, CHANNEL_ID or OPENAI_API_KEY in .env');
+if (!DISCORD_TOKEN || !CHANNEL_ID || !AI_API_KEY) {
+  console.error('Missing DISCORD_TOKEN, CHANNEL_ID or AI_API_KEY in .env');
   process.exit(1);
 }
 
@@ -150,18 +151,18 @@ async function aiReply(channel) {
   // OpenAI takes the persona as a "system" message at the start
   const messages = [{ role: 'system', content: PERSONA }, ...history];
 
-  const models = [OPENAI_MODEL, OPENAI_FALLBACK_MODEL].filter(Boolean);
+  const models = [AI_MODEL, AI_FALLBACK_MODEL].filter(Boolean);
   const startedAt = Date.now();
   let data;
 
   // Try each model up to 2 times. Busy errors (503/429) move on to the next try.
   for (const model of models) {
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      const res = await fetch(`${AI_BASE_URL}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
+          Authorization: `Bearer ${AI_API_KEY}`,
         },
         body: JSON.stringify({
           model,
@@ -177,18 +178,18 @@ async function aiReply(channel) {
 
       const body = await res.text();
       const overloaded = res.status === 503 || res.status === 429;
-      console.warn(`openai ${model} attempt ${attempt} failed (${res.status})`);
-      if (!overloaded) throw new Error(`OpenAI API ${res.status}: ${body}`);
+      console.warn(`ai ${model} attempt ${attempt} failed (${res.status}): ${body.slice(0, 200)}`);
+      if (!overloaded) throw new Error(`AI API ${res.status}: ${body}`);
       await sleep(800);
     }
 
     if (data) {
-      console.log(`openai (${model}) replied in ${Date.now() - startedAt}ms`);
+      console.log(`ai (${model}) replied in ${Date.now() - startedAt}ms`);
       break;
     }
   }
 
-  if (!data) throw new Error('OpenAI is overloaded or out of quota, all attempts failed');
+  if (!data) throw new Error('AI provider is overloaded or rate limited, all attempts failed');
 
   const text = data.choices?.[0]?.message?.content ?? '';
 
