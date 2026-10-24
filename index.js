@@ -4,16 +4,16 @@ import { Client, GatewayIntentBits, Events } from 'discord.js';
 const {
   DISCORD_TOKEN,
   CHANNEL_ID,
-  GEMINI_API_KEY,
-  GEMINI_MODEL = 'gemini-3.8-flash',
-  GEMINI_FALLBACK_MODEL,
+  OPENAI_API_KEY,
+  OPENAI_MODEL = 'gpt-4o-mini',
+  OPENAI_FALLBACK_MODEL,
   MENTION_ONLY = 'false',
   COOLDOWN_MS = '1500',
   AI_TIMEOUT_MS = '10000',
 } = process.env;
 
-if (!DISCORD_TOKEN || !CHANNEL_ID || !GEMINI_API_KEY) {
-  console.error('Missing DISCORD_TOKEN, CHANNEL_ID or GEMINI_API_KEY in .env');
+if (!DISCORD_TOKEN || !CHANNEL_ID || !OPENAI_API_KEY) {
+  console.error('Missing DISCORD_TOKEN, CHANNEL_ID or OPENAI_API_KEY in .env');
   process.exit(1);
 }
 
@@ -78,11 +78,6 @@ const CUSTOM_REPLIES = [
   { match: /\byou('?re| are)?\s*(not|isn'?t)\s*real\b/i, replies: ['omfg', 'im literally a bot 😭'] },
 ];
 
-// ---------------------------------------------------------------------------
-// HELPERS
-// ---------------------------------------------------------------------------
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 // Sent when the AI takes too long or fails. Add as many as you like.
 const BUSY_REPLIES = [
   'im busy rn',
@@ -95,6 +90,12 @@ const BUSY_REPLIES = [
   'cant talk rn im busy',
 ];
 
+// ---------------------------------------------------------------------------
+// HELPERS
+// ---------------------------------------------------------------------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
 // Rejects if the promise takes longer than `ms`.
 const withTimeout = (promise, ms) =>
   Promise.race([
@@ -103,10 +104,9 @@ const withTimeout = (promise, ms) =>
       setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)
     ),
   ]);
-const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
 let lastReplyAt = 0;
-let busy = false;
+let working = false;
 
 // Sends lines one by one with a typing indicator so it feels human.
 async function sendHuman(channel, lines) {
@@ -144,41 +144,31 @@ async function buildHistory(channel) {
 }
 
 async function aiReply(channel) {
-  const messages = await buildHistory(channel);
-  if (!messages.length) return [];
+  const history = await buildHistory(channel);
+  if (!history.length) return [];
 
-  // Gemini uses "model" instead of "assistant" and wraps text in "parts"
-  const contents = messages.map((m) => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: m.content }],
-  }));
+  // OpenAI takes the persona as a "system" message at the start
+  const messages = [{ role: 'system', content: PERSONA }, ...history];
 
-  const models = [GEMINI_MODEL, GEMINI_FALLBACK_MODEL].filter(Boolean);
+  const models = [OPENAI_MODEL, OPENAI_FALLBACK_MODEL].filter(Boolean);
   const startedAt = Date.now();
   let data;
 
   // Try each model up to 2 times. Busy errors (503/429) move on to the next try.
   for (const model of models) {
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': GEMINI_API_KEY,
-          },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: PERSONA }] },
-            contents,
-            generationConfig: {
-              maxOutputTokens: 200,
-              temperature: 1,
-              thinkingConfig: { thinkingBudget: 0 },
-            },
-          }),
-        }
-      );
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          max_completion_tokens: 300,
+        }),
+      });
 
       if (res.ok) {
         data = await res.json();
@@ -186,22 +176,21 @@ async function aiReply(channel) {
       }
 
       const body = await res.text();
-      const busy = res.status === 503 || res.status === 429;
-      console.warn(`gemini ${model} attempt ${attempt} failed (${res.status})`);
-      if (!busy) throw new Error(`Gemini API ${res.status}: ${body}`);
+      const overloaded = res.status === 503 || res.status === 429;
+      console.warn(`openai ${model} attempt ${attempt} failed (${res.status})`);
+      if (!overloaded) throw new Error(`OpenAI API ${res.status}: ${body}`);
       await sleep(800);
     }
 
     if (data) {
-      console.log(`gemini (${model}) replied in ${Date.now() - startedAt}ms`);
+      console.log(`openai (${model}) replied in ${Date.now() - startedAt}ms`);
       break;
     }
   }
 
-  if (!data) throw new Error('Gemini is overloaded, all attempts failed');
-  const text = (data.candidates?.[0]?.content?.parts ?? [])
-    .map((p) => p.text ?? '')
-    .join('\n');
+  if (!data) throw new Error('OpenAI is overloaded or out of quota, all attempts failed');
+
+  const text = data.choices?.[0]?.message?.content ?? '';
 
   return text
     .split('\n')
@@ -229,8 +218,8 @@ client.on(Events.MessageCreate, async (msg) => {
   }
 
   // cost / spam control
-  if (busy || Date.now() - lastReplyAt < cooldown) return;
-  busy = true;
+  if (working || Date.now() - lastReplyAt < cooldown) return;
+  working = true;
 
   try {
     const rule = CUSTOM_REPLIES.find((r) => r.match.test(msg.content));
@@ -254,7 +243,7 @@ client.on(Events.MessageCreate, async (msg) => {
   } catch (err) {
     console.error('reply failed:', err.message);
   } finally {
-    busy = false;
+    working = false;
   }
 });
 
